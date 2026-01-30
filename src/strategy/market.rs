@@ -5,7 +5,7 @@ use futures_util::stream::SplitStream;
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_native_tls::TlsStream;
-
+use crate::utils::logger::LogFormatter;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -73,7 +73,7 @@ impl MarketStrategy {
             map.insert(inst_id.clone(), ticker.clone());
         }
 
-        let spread = ticker.ask_px - ticker.bid_px;
-        info!("⚡ [{}] Last: {:.2} | Spread: {:.2}", inst_id, ticker.last, spread);
+        let log_msg = LogFormatter::format_ticker(&ticker);
+        info!("{}", log_msg);
     }
 }

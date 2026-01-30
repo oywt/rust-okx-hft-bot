@@ -2,7 +2,8 @@
 mod config;
 mod okx;
 mod strategy;
-// mod utils; // 如果你有 utils 模块就保留
+
+pub mod utils;
 
 use futures_util::{SinkExt, StreamExt};
 use crate::config::AppConfig;
