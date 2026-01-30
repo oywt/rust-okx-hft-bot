@@ -1,58 +1,79 @@
 use futures_util::StreamExt;
-use log::{info, error, warn};
+use log::{info, error};
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::stream::SplitStream;
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
-
-// [新增] 引入 TLS 流类型 (因为 client.rs 现在传过来的是强制加密流)
 use tokio_native_tls::TlsStream;
 
-// [修改] 关键修复：把 MaybeTlsStream 改成 TlsStream<TcpStream>
-// 这样就和 main.rs 里传进来的流类型完全对齐了
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+use crate::okx::protocol::WsRouter;
+use crate::okx::market_data::Ticker;
+
+
 type WsReadStream = SplitStream<WebSocketStream<TlsStream<TcpStream>>>;
 
 pub struct MarketStrategy {
-    // 这里未来可以放一些状态，比如当前的持仓、目标价格等
+    ticker_map: RwLock<HashMap<String, Ticker>>,
 }
 
 impl MarketStrategy {
     pub fn new() -> Self {
-        MarketStrategy {}
+        MarketStrategy {
+            ticker_map: RwLock::new(HashMap::new()),
+        }
     }
 
-    /// 启动策略循环
     pub async fn run(&self, mut read: WsReadStream) {
-        info!("🧠 [策略] 市场监控引擎已启动，正在监听数据...");
-
+        info!("🧠 [策略引擎] HFT 模式启动 (Zero-Copy Router)...");
         while let Some(msg_result) = read.next().await {
             match msg_result {
-                Ok(Message::Text(text)) => {
-                    // 这里是处理文本消息的核心逻辑
-                    self.handle_message(&text);
-                }
-                Ok(Message::Ping(_)) => {
-                    // Tungstenite 库会自动处理 Pong，不需要手动回复
-                }
-                Err(e) => {
-                    error!("❌ [网络] WebSocket 读取错误: {}", e);
-                    break; // 出错退出循环
-                }
+                Ok(Message::Text(text)) => self.dispatch(&text),
+                Ok(Message::Ping(_)) => {},
+                Err(e) => { error!("❌ WebSocket 中断: {}", e); break; }
                 _ => {}
             }
         }
-        warn!("🛑 [策略] WebSocket 连接已断开，循环结束。");
     }
 
-    /// 处理具体的 JSON 消息
-    fn handle_message(&self, text: &str) {
-        // 简单验证登录是否成功
-        if text.contains("login") && text.contains("0") {
-            info!("✅ [OKX] 登录验证成功！权限已解锁。");
-        } else if text.contains("error") {
-            error!("❌ [OKX] 收到错误消息: {}", text);
-        } else {
-            info!("📩 [数据] 收到推送: {}", text);
+    fn dispatch(&self, text: &str) {
+        // 1. 零拷贝路由
+        let router: WsRouter = match serde_json::from_str(text) {
+            Ok(r) => r,
+            Err(e) => {
+                // 🛠️ 增强：如果最外层解析都失败了，打印原始文本方便调试
+                error!("❌ [解析失败] 无法识别的消息格式: {} | Raw: {}", e, text);
+                return;
+            }
+        };
+
+        // 2. 业务处理
+        if let Some(arg) = router.arg {
+            if arg.channel == "tickers" {
+                if let Some(raw_data) = router.data {
+                    // RawValue -> Ticker (f64)
+                    if let Ok(tickers) = serde_json::from_str::<Vec<Ticker>>(raw_data.get()) {
+                        for t in tickers { self.on_market_ticker(t); }
+                    }
+                }
+            }
+        } else if let Some(event) = router.event {
+            if event == "error" {
+                error!("❌ OKX Error: {:?} {:?}", router.code, router.msg);
+            }
         }
+    }
+
+    fn on_market_ticker(&self, ticker: Ticker) {
+        let inst_id = ticker.inst_id.clone();
+        {
+            let mut map = self.ticker_map.write().unwrap();
+            map.insert(inst_id.clone(), ticker.clone());
+        }
+
+        let spread = ticker.ask_px - ticker.bid_px;
+        info!("⚡ [{}] Last: {:.2} | Spread: {:.2}", inst_id, ticker.last, spread);
     }
 }
