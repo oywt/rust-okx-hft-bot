@@ -20,8 +20,8 @@ pub enum Endpoint {
 impl Endpoint {
     pub fn as_url(&self) -> &'static str {
         match self {
-            Endpoint::Public => "wss://ws.okx.com:8443/ws/v5/public",
-            Endpoint::Private => "wss://ws.okx.com:8443/ws/v5/private",
+            Endpoint::Public => "wss://ws.okx.com/ws/v5/public",
+            Endpoint::Private => "wss://ws.okx.com/ws/v5/private",
         }
     }
 }
@@ -60,6 +60,9 @@ pub struct WsRouter {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WsArg {
     pub channel: String,
+
+    #[serde(rename = "instId")]
+    pub inst_id: Option<String>,
     pub instId: Option<String>,
     pub ccy: Option<String>,
 }

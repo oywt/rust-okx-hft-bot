@@ -9,9 +9,10 @@ impl LogFormatter {
     /// 🎨 [组件功能] 格式化 Ticker 日志
     /// 优势：直接接受 Ticker 引用，内聚性更强，参数更简洁
     pub fn format_ticker(ticker: &Ticker) -> String {
-        // 1. 业务计算 (Spread)
-        // 注意：这里只做展示用的计算，不涉及核心策略逻辑
+
+        // ⚔️ 真实价差 = 卖一 - 买一
         let spread = ticker.ask_px - ticker.bid_px;
+        let spread_pct = (spread / ticker.ask_px) * 100.0; // 价差占比
 
         // 2. ⏱️ 延迟计算
         // 解析 OKX 时间戳 (如果解析失败默认为 0)
@@ -30,10 +31,11 @@ impl LogFormatter {
 
         // 4. 组装日志
         format!(
-            "⚡ [{}] Last: {} | Spread: {:.2} | Latency: {}",
+            "⚡ [{}] Bid: {} | Ask: {} | Spread: {:.4}% | Lat: {}",
             ticker.inst_id.cyan().bold(),
-            ticker.last.to_string().yellow(),
-            spread,
+            ticker.bid_px.to_string().red(),   // 卖的时候看这个
+            ticker.ask_px.to_string().green(), // 买的时候看这个
+            spread_pct,
             latency_display
         )
     }
