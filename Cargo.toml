@@ -40,3 +40,5 @@ native-tls = "0.2"
 tokio-native-tls = "0.3"
 
 colored = "2.0"
+
+uuid = { version = "1.4", features = ["v4", "fast-rng"] }

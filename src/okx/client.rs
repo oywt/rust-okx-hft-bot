@@ -1,17 +1,17 @@
 // src/okx/client.rs
 
-use crate::okx::{auth, protocol::Endpoint};
+pub(crate) use crate::okx::{auth, protocol::Endpoint};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{client_async, WebSocketStream};
 use url::Url;
-use log::{info, error};
+use log::{info, error, warn};
 
 use async_http_proxy::http_connect_tokio;
 use native_tls::TlsConnector;
 use tokio_native_tls::TlsConnector as TokioTlsConnector;
-
+use tokio_tungstenite::tungstenite::Message;
 type WsStream = WebSocketStream<tokio_native_tls::TlsStream<TcpStream>>;
 
 pub struct OkxClient {
@@ -86,8 +86,9 @@ impl OkxClient {
         }
     }
 
+    // ✨ [核心修改] 阻塞式登录：发包后等待响应，确认成功才返回
     async fn login(&self, ws_stream: WsStream, config: &crate::config::AppConfig) -> Option<WsStream> {
-        let (mut write, read) = ws_stream.split();
+        let (mut write, mut read) = ws_stream.split(); // 注意这里 read 也是 mut
         let timestamp = chrono::Utc::now().timestamp().to_string();
         let sign = auth::generate_sign(&config.okx_secret_key, &timestamp);
 
@@ -101,12 +102,40 @@ impl OkxClient {
             }]
         });
 
-        if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(login_msg.to_string())).await {
+        // 1. 发送登录请求
+        if let Err(e) = write.send(Message::Text(login_msg.to_string())).await {
             error!("❌ 登录包发送失败: {}", e);
             return None;
         }
+        info!("📤 登录请求已发送，等待服务器确认...");
 
-        info!("📤 登录请求已发送");
-        Some(write.reunite(read).unwrap())
+        // 2. ⏳ 原地等待响应 (关键！)
+        // 我们只读第一条消息，它必须是登录结果
+        while let Some(msg_res) = read.next().await {
+            match msg_res {
+                Ok(Message::Text(text)) => {
+                    // 解析 JSON 检查 code
+                    // 简易解析，只要包含 "login" 和 "0" 就认为成功
+                    if text.contains("\"event\":\"login\"") && text.contains("\"code\":\"0\"") {
+                        info!("✅ 登录鉴权成功 (Login Authorized)");
+                        // 3. 登录成功，把流合并回去，交还给 main
+                        return Some(write.reunite(read).unwrap());
+                    } else if text.contains("\"event\":\"error\"") {
+                        error!("❌ 登录被拒绝: {}", text);
+                        return None;
+                    } else {
+                        warn!("⚠️ 收到非登录响应 (忽略): {}", text);
+                    }
+                },
+                Ok(_) => {}, // 忽略 Ping/Pong 等其他帧
+                Err(e) => {
+                    error!("❌ 等待登录响应时断开: {}", e);
+                    return None;
+                }
+            }
+        }
+
+        error!("❌ 连接在登录阶段意外关闭");
+        None
     }
 }

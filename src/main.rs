@@ -1,68 +1,77 @@
-// 声明模块
+use crate::config::AppConfig;
+use crate::okx::client::{OkxClient, Endpoint};
+use crate::okx::protocol::{self, ChannelType};
+use crate::strategy::market::MarketStrategy;
+use futures_util::{SinkExt, StreamExt};
+use log::info;
+// ✅ [修正 1] 引入 Message 类型，用于包装发送的数据
+use tokio_tungstenite::tungstenite::Message;
+
+// 引入模块
 mod config;
 mod okx;
 mod strategy;
-
-pub mod utils;
-
-use futures_util::{SinkExt, StreamExt};
-use crate::config::AppConfig;
-use crate::okx::client::OkxClient;
-use crate::strategy::market::MarketStrategy;
-use log::{info, error};
-use crate::okx::protocol::{self, ChannelType, Endpoint};
 
 #[tokio::main]
 async fn main() {
     // 1. 初始化日志
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    info!("🚀 [启动] Rust HFT 高频交易机器人 v0.2 (DDD Refactored)");
 
-    // 2. 加载配置
+    info!("==================================================");
+    info!("🏴‍☠️  Rust HFT Sniper Bot v0.3 [Massive Scan Edition]");
+    info!("🚀  Target: Top 60+ Volatile Assets");
+    info!("==================================================");
+
     let config = AppConfig::load();
 
-    // 3. 初始化 OKX 客户端 (使用 Public 演示行情，如需交易请改为 Private 并配置 key)
-    let client = OkxClient::new(Endpoint::Public);
+    info!("🔗 正在连接 OKX Private WebSocket...");
+    let client = OkxClient::new(Endpoint::Private);
 
-    // 4. 连接
     let ws_stream = match client.connect(&config).await {
         Some(s) => s,
         None => {
-            error!("❌ [致命] 无法连接到 OKX，程序退出。");
+            info!("❌ 连接失败，请检查 API Key 和 网络配置");
             return;
         }
     };
 
-    // 5. 拆分流
     let (mut write, read) = ws_stream.split();
 
-    // ==========================================
-    // 📡 [批量订阅] 支持多币种
-    // ==========================================
-    // 定义我们需要监听的投资组合
-    let portfolio = vec!["BTC-USDT", "ETH-USDT", "SOL-USDT"];
+    // 2. 🎯 [全市场选品] 狙击手目标清单
+    let watchlist = vec![
+        "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT",
+        "DOGE-USDT", "PEPE-USDT", "SHIB-USDT", "BONK-USDT", "WIF-USDT", "FLOKI-USDT", "MEME-USDT", "BOME-USDT",
+        "ORDI-USDT", "SATS-USDT", "RATS-USDT",
+        "RNDR-USDT", "WLD-USDT", "FET-USDT", "TAO-USDT", "AR-USDT", "FIL-USDT",
+        "SUI-USDT", "SEI-USDT", "APT-USDT", "ARB-USDT", "OP-USDT", "TIA-USDT", "AVAX-USDT", "NEAR-USDT", "MATIC-USDT", "DOT-USDT", "ADA-USDT", "TRX-USDT", "LINK-USDT",
+        "XRP-USDT", "LTC-USDT", "BCH-USDT", "ETC-USDT", "EOS-USDT", "FIL-USDT",
+        "JUP-USDT", "PYTH-USDT", "BLUR-USDT", "DYDX-USDT", "IMX-USDT", "LDO-USDT", "INJ-USDT", "ATOM-USDT"
+    ];
 
-    info!("📡 [指令] 正在批量订阅行情: {:?}", portfolio);
+    info!("📡 [全域雷达] 正在锁定 {} 个高波动目标...", watchlist.len());
 
-    for inst_id in portfolio {
-        let sub_msg = protocol::create_subscribe_packet(ChannelType::Tickers, inst_id);
-        if let Err(e) = write.send(sub_msg).await {
-            error!("❌ [订阅] {} 发送失败: {}", inst_id, e);
-        } else {
-            // 简单的流控，防止发包过快被断开 (Optional)
-            // tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    // 3. 🛡️ [战术分批订阅]
+    let batch_size = 10;
+    for (i, chunk) in watchlist.chunks(batch_size).enumerate() {
+        info!("📡 发送第 {} 批订阅指令 ({} 个)...", i + 1, chunk.len());
+
+        for inst_id in chunk {
+            let sub = protocol::create_subscribe_packet(ChannelType::Tickers, inst_id);
+            // ✅ [修正 2] 包装成 Message::Text
+            write.send(Message::Text(sub)).await.unwrap();
         }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
-    info!("✅ [指令] 订阅请求全部发送完毕。");
 
-    // 持有 write 流，未来用于发单
-    let _write_handle = write;
+    // 4. 订阅账户余额 (Account)
+    let sub_acc = protocol::create_subscribe_packet(ChannelType::Account, "USDT");
+    // ✅ [修正 3] 包装成 Message::Text
+    write.send(Message::Text(sub_acc)).await.unwrap();
 
-    // 6. 启动策略引擎
+    info!("✅ [系统就绪] 全市场扫描已激活，等待任意标的暴跌 > 3% ...");
+
+    // 5. 移交控制权
     let strategy = MarketStrategy::new();
-
-    // 进入死循环，等待 WebSocket 数据
-    strategy.run(read).await;
-
-    info!("👋 [退出] 主程序结束。");
+    strategy.run(read, write).await;
 }
