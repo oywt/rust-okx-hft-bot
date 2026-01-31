@@ -24,67 +24,74 @@ impl OkxClient {
     }
 
     pub async fn connect(&self, config: &crate::config::AppConfig) -> Option<WsStream> {
-        // 1. 解析目标 URL
         let url_str = self.endpoint.as_url();
         let target_url = Url::parse(url_str).unwrap();
         let target_host = target_url.host_str().unwrap();
-        // 自动识别端口：如果是 wss:// 则默认为 443
         let target_port = target_url.port_or_known_default().unwrap_or(443);
 
-        // 2. 解析代理配置
-        let proxy_url_str = config.proxy_url.as_ref().expect("❌ 未配置 PROXY_URL");
-        let proxy_url = Url::parse(proxy_url_str).unwrap();
-        let proxy_host = proxy_url.host_str().unwrap();
-        let proxy_port = proxy_url.port().unwrap();
+        // ==========================================
+        // 🚦 智能分支：根据是否配置代理决定连接方式
+        // ==========================================
+        if let Some(proxy_url_str) = &config.proxy_url {
+            // ➤ 分支 A: 走代理 (本地开发)
+            let proxy_url = Url::parse(proxy_url_str).unwrap();
+            let proxy_host = proxy_url.host_str().unwrap();
+            let proxy_port = proxy_url.port().unwrap();
 
-        info!("🔗 连接路径: 本地 -> 代理({}:{}) -> OKX({}:{})",
-            proxy_host, proxy_port, target_host, target_port);
+            info!("🔗 [模式] 代理连接: {} -> OKX", proxy_url_str);
 
-        // 3. TCP 连接代理
-        let mut tcp_stream = match TcpStream::connect(format!("{}:{}", proxy_host, proxy_port)).await {
-            Ok(s) => s,
-            Err(e) => {
-                error!("❌ 连接代理服务器失败: {}", e);
-                error!("👉 请检查: 1. v2rayN 是否启动 2. .env端口是否填对(默认10809?)");
-                return None;
+            let mut tcp_stream = match TcpStream::connect(format!("{}:{}", proxy_host, proxy_port)).await {
+                Ok(s) => s,
+                Err(e) => { error!("❌ 代理连接失败: {}", e); return None; }
+            };
+            let _ = tcp_stream.set_nodelay(true);
+
+            if let Err(e) = http_connect_tokio(&mut tcp_stream, target_host, target_port).await {
+                error!("❌ 代理握手失败: {}", e); return None;
             }
-        };
 
-        // 优化：禁用 Nagle 算法
-        let _ = tcp_stream.set_nodelay(true);
+            // 代理模式下，通常需要跳过证书验证 (防止MITM)
+            let cx = TlsConnector::builder().danger_accept_invalid_certs(true).build().unwrap();
+            let cx = TokioTlsConnector::from(cx);
+            let tls_stream = match cx.connect(target_host, tcp_stream).await {
+                Ok(s) => s, Err(e) => { error!("❌ TLS 失败: {}", e); return None; }
+            };
 
-        // 4. HTTP 隧道握手
-        if let Err(e) = http_connect_tokio(&mut tcp_stream, target_host, target_port).await {
-            error!("❌ 代理隧道握手失败 (EOF通常意味着端口协议不对，比如连到了Socks端口): {}", e);
-            return None;
-        }
+            let (ws_stream, _) = client_async(url_str, tls_stream).await.ok()?;
 
-        // 5. TLS 握手
-        // 🛡️ 容错模式：允许无效证书（防止代理软件MITM干扰）
-        let cx = TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap();
-        let cx = TokioTlsConnector::from(cx);
+            // 返回流
+            match self.endpoint {
+                Endpoint::Public => Some(ws_stream),
+                Endpoint::Private => self.login(ws_stream, config).await,
+            }
 
-        let tls_stream = match cx.connect(target_host, tcp_stream).await {
-            Ok(s) => s,
-            Err(e) => { error!("❌ TLS 握手失败: {}", e); return None; }
-        };
+        } else {
+            // ➤ 分支 B: 直连 (香港/东京服务器)
+            info!("🔗 [模式] 直连 OKX (无代理) -> {}:{}", target_host, target_port);
 
-        // 6. WebSocket 升级
-        let (ws_stream, _) = match client_async(url_str, tls_stream).await {
-            Ok(v) => v,
-            Err(e) => { error!("❌ WS 升级失败: {}", e); return None; }
-        };
+            let tcp_stream = match TcpStream::connect(format!("{}:{}", target_host, target_port)).await {
+                Ok(s) => s,
+                Err(e) => { error!("❌ 直连失败 (请检查服务器网络): {}", e); return None; }
+            };
+            let _ = tcp_stream.set_nodelay(true);
 
-        info!("✅ OKX WebSocket 连接建立成功！");
+            // 直连模式下，证书必须是合法的，不能跳过验证！
+            let cx = TlsConnector::builder().build().unwrap();
+            let cx = TokioTlsConnector::from(cx);
+            let tls_stream = match cx.connect(target_host, tcp_stream).await {
+                Ok(s) => s, Err(e) => { error!("❌ TLS 失败: {}", e); return None; }
+            };
 
-        match self.endpoint {
-            Endpoint::Public => Some(ws_stream),
-            Endpoint::Private => self.login(ws_stream, config).await,
+            let (ws_stream, _) = client_async(url_str, tls_stream).await.ok()?;
+
+            // 返回流
+            match self.endpoint {
+                Endpoint::Public => Some(ws_stream),
+                Endpoint::Private => self.login(ws_stream, config).await,
+            }
         }
     }
+
 
     // ✨ [核心修改] 阻塞式登录：发包后等待响应，确认成功才返回
     async fn login(&self, ws_stream: WsStream, config: &crate::config::AppConfig) -> Option<WsStream> {
