@@ -2,76 +2,98 @@ use crate::config::AppConfig;
 use crate::okx::client::{OkxClient, Endpoint};
 use crate::okx::protocol::{self, ChannelType};
 use crate::strategy::market::MarketStrategy;
+// ✅ [修复] 必须引入 SinkExt 才能调用 .send()，必须引入 StreamExt 才能调用 .next()
 use futures_util::{SinkExt, StreamExt};
-use log::info;
-// ✅ [修正 1] 引入 Message 类型，用于包装发送的数据
+use log::{info, error};
 use tokio_tungstenite::tungstenite::Message;
 
-// 引入模块
 mod config;
 mod okx;
 mod strategy;
 
 #[tokio::main]
 async fn main() {
-    // 1. 初始化日志
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     info!("==================================================");
-    info!("🏴‍☠️  Rust HFT Sniper Bot v0.3 [Massive Scan Edition]");
-    info!("🚀  Target: Top 60+ Volatile Assets");
+    info!("🏴‍☠️  Rust HFT Sniper Bot v0.5 [Final Fix]");
     info!("==================================================");
 
     let config = AppConfig::load();
 
-    info!("🔗 正在连接 OKX Private WebSocket...");
-    let client = OkxClient::new(Endpoint::Private);
-
-    let ws_stream = match client.connect(&config).await {
+    // -----------------------------------------------------------
+    // 🔗 1. Public 连接 (只听行情)
+    // -----------------------------------------------------------
+    info!("🔗 [1/2] 连接 Public 频道 (行情)...");
+    let client_pub = OkxClient::new(Endpoint::Public);
+    let ws_pub = match client_pub.connect(&config).await {
         Some(s) => s,
-        None => {
-            info!("❌ 连接失败，请检查 API Key 和 网络配置");
-            return;
-        }
+        None => return,
     };
+    let (mut write_pub, read_pub) = ws_pub.split();
 
-    let (mut write, read) = ws_stream.split();
-
-    // 2. 🎯 [全市场选品] 狙击手目标清单
+    // 订阅行情
     let watchlist = vec![
+        // --- 👑 核心主流 ---
         "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT",
+        // --- 🐕 活跃 Meme ---
         "DOGE-USDT", "PEPE-USDT", "SHIB-USDT", "BONK-USDT", "WIF-USDT", "FLOKI-USDT", "MEME-USDT", "BOME-USDT",
-        "ORDI-USDT", "SATS-USDT", "RATS-USDT",
-        "RNDR-USDT", "WLD-USDT", "FET-USDT", "TAO-USDT", "AR-USDT", "FIL-USDT",
-        "SUI-USDT", "SEI-USDT", "APT-USDT", "ARB-USDT", "OP-USDT", "TIA-USDT", "AVAX-USDT", "NEAR-USDT", "MATIC-USDT", "DOT-USDT", "ADA-USDT", "TRX-USDT", "LINK-USDT",
-        "XRP-USDT", "LTC-USDT", "BCH-USDT", "ETC-USDT", "EOS-USDT", "FIL-USDT",
+        // --- 📜 铭文 ---
+        "ORDI-USDT", "SATS-USDT",
+        // ❌ 移除 RATS (报错)
+
+        // --- 🤖 AI & Layer 1/2 ---
+        "RENDER-USDT", // ✅ 修正: RNDR -> RENDER
+        "WLD-USDT", "FET-USDT",
+        // ❌ 移除 TAO (报错)
+        "AR-USDT", "FIL-USDT",
+
+        "SUI-USDT", "SEI-USDT", "APT-USDT", "ARB-USDT", "OP-USDT", "TIA-USDT", "AVAX-USDT", "NEAR-USDT",
+        "POL-USDT",    // ✅ 修正: MATIC -> POL
+        "DOT-USDT", "ADA-USDT", "TRX-USDT", "LINK-USDT",
+
+        // --- 🎢 老牌/热门 ---
+        "XRP-USDT", "LTC-USDT", "BCH-USDT", "ETC-USDT",
+        // ❌ 移除 EOS (报错)
+
         "JUP-USDT", "PYTH-USDT", "BLUR-USDT", "DYDX-USDT", "IMX-USDT", "LDO-USDT", "INJ-USDT", "ATOM-USDT"
     ];
+    info!("📡 [Public] 订阅 {} 个目标...", watchlist.len());
 
-    info!("📡 [全域雷达] 正在锁定 {} 个高波动目标...", watchlist.len());
-
-    // 3. 🛡️ [战术分批订阅]
-    let batch_size = 10;
-    for (i, chunk) in watchlist.chunks(batch_size).enumerate() {
-        info!("📡 发送第 {} 批订阅指令 ({} 个)...", i + 1, chunk.len());
-
+    for chunk in watchlist.chunks(10) {
         for inst_id in chunk {
             let sub = protocol::create_subscribe_packet(ChannelType::Tickers, inst_id);
-            // ✅ [修正 2] 包装成 Message::Text
-            write.send(Message::Text(sub)).await.unwrap();
+            if let Err(e) = write_pub.send(Message::Text(sub)).await {
+                error!("❌ 订阅发送失败: {}", e);
+            }
         }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 
-    // 4. 订阅账户余额 (Account)
+    // -----------------------------------------------------------
+    // 🔗 2. Private 连接 (只做交易)
+    // -----------------------------------------------------------
+    info!("🔗 [2/2] 连接 Private 频道 (交易)...");
+    let client_priv = OkxClient::new(Endpoint::Private);
+    // client.connect 内部已完成登录鉴权
+    let ws_priv = match client_priv.connect(&config).await {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut write_priv, read_priv) = ws_priv.split();
+
+    // 订阅账户
     let sub_acc = protocol::create_subscribe_packet(ChannelType::Account, "USDT");
-    // ✅ [修正 3] 包装成 Message::Text
-    write.send(Message::Text(sub_acc)).await.unwrap();
+    if let Err(e) = write_priv.send(Message::Text(sub_acc)).await {
+        error!("❌ 账户订阅失败: {}", e);
+    }
 
-    info!("✅ [系统就绪] 全市场扫描已激活，等待任意标的暴跌 > 3% ...");
+    info!("✅ [双线就绪] 策略引擎启动...");
 
-    // 5. 移交控制权
+    // -----------------------------------------------------------
+    // 🧠 3. 策略引擎
+    // -----------------------------------------------------------
     let strategy = MarketStrategy::new();
-    strategy.run(read, write).await;
+    // ✅ 传入 4 个参数，对应 market.rs 的新签名
+    strategy.run(read_pub, write_pub, read_priv, write_priv).await;
 }
