@@ -58,8 +58,6 @@ cargo run --release
 ```
 
 #### 第二步：创建 `.env.example`
-因为 `.env` 被忽略了，别人不知道怎么配。你需要新建一个 `.env.example` 文件（不含真实 Key），上传上去给别人参考：
-
 ```bash
 # OKX API Configuration
 OKX_API_KEY=
